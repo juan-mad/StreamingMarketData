@@ -49,7 +49,7 @@ async def main():
                     raise RuntimeError(f"Subscription failed: {message.get('error')}")
                 print("Suscribed:", message["result"]["symbol"])
             elif message.get("channel") == "book":
-                logger.info("%s", message)
+                logger.info('%s', raw_message)
             # else:
             #     print(f"Unhandled message: {message}")
                     
