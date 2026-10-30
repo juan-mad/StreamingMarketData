@@ -50,8 +50,8 @@ async def main():
                 print("Suscribed:", message["result"]["symbol"])
             elif message.get("channel") == "book":
                 logger.info("%s", message)
-            else:
-                print(f"Unhandled message: {message}")
+            # else:
+            #     print(f"Unhandled message: {message}")
                     
 
 
