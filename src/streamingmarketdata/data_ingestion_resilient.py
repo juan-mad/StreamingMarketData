@@ -1,8 +1,16 @@
-"""Collect Kraken book JSON with reconnects and separate operational logging.
+"""Archive Kraken book messages while recovering from transient connection errors.
 
-Run with ``python -m streamingmarketdata.data_ingestion_resilient``.
-Each connection requests new snapshots; updates missed while disconnected
-cannot be recovered by this collector.
+Run with ``python -m streamingmarketdata.data_ingestion_resilient``. Configure
+symbols, book depth, log directory, and timeouts through the module constants;
+all timeout and retry-delay constants are expressed in seconds.
+
+Book messages retain their original numeric text in JSONL files, which rotate
+every 15 minutes without deleting old files. Operational messages go to stderr
+and a separate UTC diagnostic log, which rotates daily with seven backups.
+
+Each connection requests fresh snapshots before accepting updates for a symbol.
+The collector validates message envelopes, but does not reconstruct books or
+verify checksums. Updates missed while disconnected cannot be recovered here.
 """
 
 import asyncio
@@ -13,6 +21,7 @@ import signal
 import ssl
 import sys
 import time
+from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
@@ -35,43 +44,109 @@ STABLE_CONNECTION_TIME = 60.0
 
 
 class ReconnectRequired(RuntimeError):
-    """The current session cannot safely continue."""
+    """Signal that an unsafe or incomplete session needs fresh snapshots."""
 
 
 class SubscriptionRejected(RuntimeError):
-    """The subscription must be corrected before trying again."""
+    """Signal a subscription rejection that is not classified as temporary."""
 
 
 class DataWriteError(RuntimeError):
-    """Stop collection when received data cannot be saved."""
+    """Signal a book-log failure that must stop collection rather than reconnect."""
 
 
 class StrictFileHandler(TimedRotatingFileHandler):
+    """Rotate book logs while propagating write failures to the collector."""
+
     def handleError(self, record: logging.LogRecord) -> None:
-        # Standard logging otherwise prints an error and discards the record.
+        """Turn a logging failure into a fatal collector error.
+
+        Standard logging may report a failed write and discard the record.
+        Raising here prevents collection from continuing after that data loss.
+
+        Args:
+            record (logging.LogRecord): Record whose emission failed.
+
+        Returns:
+            None: This method always raises instead of returning normally.
+
+        Raises:
+            DataWriteError: Always, chained from the active logging exception.
+        """
         raise DataWriteError("Failed to save a book message") from sys.exception()
 
 
 class BookDataWriter:
-    def __init__(self, handler: StrictFileHandler):
+    """Write raw JSON through a rotating handler without blocking the event loop.
+
+    Callers must await writes sequentially to preserve receive order. The owner
+    of the supplied handler remains responsible for closing it.
+
+    Attributes:
+        handler (StrictFileHandler): Destination for book-message records.
+    """
+
+    def __init__(self, handler: StrictFileHandler) -> None:
+        """Store the file handler used for subsequent writes.
+
+        Args:
+            handler (StrictFileHandler): Configured handler owned by the caller.
+
+        Returns:
+            None.
+        """
         self.handler = handler
 
     async def write(self, raw_message: str) -> None:
-        # Remove JSON whitespace newlines, preserving the exact numeric text.
+        """Save one JSON message in a worker thread and wait for completion.
+
+        Physical carriage returns and newlines are removed to keep each record
+        on one line. Numeric text and escaped newlines inside strings remain
+        intact. This method expects JSON that has already been decoded safely.
+        Cancellation waits for the protected write before propagating, allowing
+        the handler to be closed without interrupting that write.
+
+        Args:
+            raw_message (str): Original, valid JSON text received from Kraken.
+
+        Returns:
+            None: Completion indicates the handler finished writing the record;
+                it does not guarantee an fsync to persistent storage.
+
+        Raises:
+            DataWriteError: The handler could not save the record.
+            asyncio.CancelledError: Collection was cancelled during the write.
+        """
         line = raw_message.replace("\r", "").replace("\n", "")
         record = logging.LogRecord("kraken.book.data", logging.INFO, "", 0, line, (), None)
         work = asyncio.create_task(asyncio.to_thread(self.handler.handle, record))
         try:
-            # Writes are awaited sequentially to preserve receive order.
             await asyncio.shield(work)
         except asyncio.CancelledError:
-            # Finish an in-flight write before the handler is closed.
             await work
             raise
 
 
 @contextmanager
-def open_logs(directory: Path):
+def open_logs(directory: Path) -> Iterator[tuple[BookDataWriter, logging.Logger]]:
+    """Provide the data writer and event logger, then clean up their handlers.
+
+    Diagnostics go to stderr and a daily UTC log with seven backups. Raw book
+    messages go to a JSONL log that rotates every 15 minutes without automatic
+    deletion. Handlers are removed and closed when the context exits, including
+    when setup or collection raises an exception.
+
+    Args:
+        directory (Path): Log directory, created with missing parent directories.
+            Relative paths are resolved against the process working directory.
+
+    Yields:
+        tuple[BookDataWriter, logging.Logger]: Writer for raw book messages and
+            logger for operational events, valid within the context.
+
+    Raises:
+        OSError: The directory or a log file cannot be created or opened.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     events = logging.getLogger("kraken.book.resilient")
     events.setLevel(logging.INFO)
@@ -106,15 +181,39 @@ def open_logs(directory: Path):
 
 @dataclass
 class SessionState:
+    """Track when the current connection became ready for normal collection.
+
+    Attributes:
+        ready_at (float | None): Event-loop monotonic time when every requested
+            symbol was acknowledged and its snapshot saved. None means startup
+            has not completed. Used to decide when retry backoff can reset.
+    """
+
     ready_at: float | None = None
 
 
 def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
+    """Decode a JSON object while preserving raw text and decimal precision.
+
+    Invalid input requests reconnection because skipping a message could omit
+    a book update. Decimal JSON numbers become Decimal values; integer JSON
+    numbers retain their normal int representation.
+
+    Args:
+        raw_message (str | bytes): WebSocket text or UTF-8 encoded message bytes.
+
+    Returns:
+        tuple[str, dict]: Original JSON text, decoded from UTF-8 if needed, and
+            its dictionary representation for message routing.
+
+    Raises:
+        ReconnectRequired: Input is invalid UTF-8, invalid JSON, or does not
+            contain a JSON object at its top level.
+    """
     try:
         raw = raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message
         message = json.loads(raw, parse_float=Decimal)
     except (UnicodeError, ValueError) as error:
-        # Skipping a malformed message could silently lose a book update.
         raise ReconnectRequired("Invalid JSON received; requesting fresh snapshots") from error
     if not isinstance(message, dict):
         raise ReconnectRequired("Expected a JSON object")
@@ -124,6 +223,38 @@ def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
 async def collect_session(
     ws: ClientConnection, writer: BookDataWriter, events: logging.Logger, state: SessionState,
 ) -> None:
+    """Subscribe and archive book messages for one established connection.
+
+    Request fresh snapshots and track acknowledgements and snapshots separately
+    for each configured symbol. A fixed startup deadline applies even while
+    heartbeats arrive. After startup, each receive has an idle timeout.
+
+    Save raw snapshots and subsequent updates sequentially. Status messages and
+    subscription warnings go to the event logger; heartbeats are not archived.
+    A symbol's updates are accepted after its snapshot has been saved, even if
+    other symbols are still starting up. This function does not verify CRC32.
+
+    Args:
+        ws (ClientConnection): Open WebSocket connection owned by the caller.
+        writer (BookDataWriter): Destination for original book-message JSON.
+        events (logging.Logger): Destination for connection and service events.
+        state (SessionState): Mutable state whose ready_at is set once all
+            acknowledgements and snapshots have been received and saved.
+
+    Returns:
+        None: Runs until connection closure, failure, or cancellation; there is
+            no normal return from the receive loop.
+
+    Raises:
+        ReconnectRequired: Messages are malformed, startup or reception stalls,
+            or Kraken reports a temporary service problem.
+        SubscriptionRejected: Kraken rejects the subscription permanently
+            according to the collector's classification.
+        ConnectionClosed: The WebSocket closes, normally or abnormally.
+        TimeoutError: Sending the subscription exceeds the startup timeout.
+        DataWriteError: A book message cannot be saved.
+        asyncio.CancelledError: The session is cancelled during shutdown.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + STARTUP_TIMEOUT
     pending_acks = set(SYMBOLS)
@@ -204,6 +335,18 @@ async def collect_session(
 
 
 def is_retryable(error: Exception) -> bool:
+    """Classify whether the same connection settings should be tried again.
+
+    Retry connection closures, explicit session-recovery requests, and selected
+    HTTP timeout, rate-limit, and server errors. Certificate verification
+    failures are fatal. Other errors use websockets' default classification.
+
+    Args:
+        error (Exception): Failure raised while connecting or collecting data.
+
+    Returns:
+        bool: True if reconnection is allowed; False if the error must propagate.
+    """
     if isinstance(error, ssl.SSLCertVerificationError):
         return False
     if isinstance(error, (ConnectionClosed, ReconnectRequired)):
@@ -214,6 +357,32 @@ def is_retryable(error: Exception) -> bool:
 
 
 async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
+    """Collect continuously, reconnecting after errors classified as temporary.
+
+    Each attempt creates a new connection and session state. Failed sessions
+    close before retrying with exponential backoff and bounded random jitter.
+    The base delay resets only after a fully ready session has remained stable
+    for STABLE_CONNECTION_TIME. Every reconnect requests fresh snapshots and
+    reports a data gap; missed historical updates are not recovered.
+
+    Connection opening, pong reception, and closing have timeouts of 20, 30,
+    and 10 seconds respectively. Keepalive pings run every 20 seconds. Incoming
+    messages are limited to 4 MiB, with a receive-buffer high-water mark of
+    128 frames.
+
+    Args:
+        writer (BookDataWriter): Shared destination for raw book messages.
+        events (logging.Logger): Logger for attempts, failures, and retry delays.
+
+    Returns:
+        None: Runs until cancellation or an unrecoverable error, without a
+            normal return from the reconnection loop.
+
+    Raises:
+        Exception: A connection or collection error is classified as fatal,
+            including subscription rejection or inability to save book data.
+        asyncio.CancelledError: Collection or a retry wait is cancelled.
+    """
     delay = MIN_RETRY_DELAY
     loop = asyncio.get_running_loop()
     while True:
@@ -242,6 +411,24 @@ async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
 
 
 async def main() -> None:
+    """Open logs and run the collector with shutdown and fatal-error reporting.
+
+    Register SIGTERM cancellation where supported; asyncio.run handles Ctrl+C
+    when this coroutine is the program entry point. Cancellation unwinds the
+    connection context and lets a protected data write finish. The installed
+    SIGTERM handler is removed before the log handlers are closed.
+
+    Args:
+        None: Configuration is read from this module's constants.
+
+    Returns:
+        None: No result is produced; normal operation continues until stopped.
+
+    Raises:
+        asyncio.CancelledError: Shutdown was requested; propagated after logging.
+        Exception: Log setup fails or ingestion encounters an unrecoverable error.
+            Ingestion failures are logged with their traceback before propagation.
+    """
     with open_logs(LOG_DIRECTORY) as (writer, events):
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
