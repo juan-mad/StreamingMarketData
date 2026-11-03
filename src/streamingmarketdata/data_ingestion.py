@@ -9,8 +9,9 @@ every 15 minutes without deleting old files. Operational messages go to stderr
 and a separate UTC diagnostic log, which rotates daily with seven backups.
 
 Each connection requests fresh snapshots before accepting updates for a symbol.
-The collector validates message envelopes, but does not reconstruct books or
-verify checksums. Updates missed while disconnected cannot be recovered here.
+Every price level and metadata field is validated, and reconstructed books are
+checked against Kraken's top-ten CRC32. Raw logs also retain rejected book
+messages for diagnosis. Updates missed while disconnected cannot be recovered.
 """
 
 import asyncio
@@ -27,7 +28,10 @@ from dataclasses import dataclass
 from decimal import Decimal
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import NoReturn
 
+from streamingmarketdata.book import Book, ChecksumFailureError
+from streamingmarketdata.book_messages import SnapshotData, UpdateData
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.client import process_exception
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -192,6 +196,21 @@ class SessionState:
     ready_at: float | None = None
 
 
+def reject_json_constant(value: str) -> NoReturn:
+    """Reject nonstandard NaN and infinity tokens during JSON decoding.
+
+    Args:
+        value (str): Non-finite numeric token encountered by the JSON decoder.
+
+    Returns:
+        NoReturn: This function always raises.
+
+    Raises:
+        ValueError: The token is not a valid finite JSON number.
+    """
+    raise ValueError(f"Non-finite JSON number: {value}")
+
+
 def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
     """Decode a JSON object while preserving raw text and decimal precision.
 
@@ -212,7 +231,7 @@ def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
     """
     try:
         raw = raw_message.decode("utf-8") if isinstance(raw_message, bytes) else raw_message
-        message = json.loads(raw, parse_float=Decimal)
+        message = json.loads(raw, parse_float=Decimal, parse_constant=reject_json_constant)
     except (UnicodeError, ValueError) as error:
         raise ReconnectRequired("Invalid JSON received; requesting fresh snapshots") from error
     if not isinstance(message, dict):
@@ -231,8 +250,10 @@ async def collect_session(
 
     Save raw snapshots and subsequent updates sequentially. Status messages and
     subscription warnings go to the event logger; heartbeats are not archived.
-    A symbol's updates are accepted after its snapshot has been saved, even if
-    other symbols are still starting up. This function does not verify CRC32.
+    A symbol's updates are accepted after its snapshot has been validated and
+    saved, even if other symbols are still starting up. Each item is validated
+    before converting its levels to dictionaries, then its CRC32 is checked.
+    Raw messages remain archived even when their validation or checksum fails.
 
     Args:
         ws (ClientConnection): Open WebSocket connection owned by the caller.
@@ -246,8 +267,8 @@ async def collect_session(
             no normal return from the receive loop.
 
     Raises:
-        ReconnectRequired: Messages are malformed, startup or reception stalls,
-            or Kraken reports a temporary service problem.
+        ReconnectRequired: Messages are malformed, validation or CRC32 fails,
+            startup or reception stalls, or Kraken reports a temporary problem.
         SubscriptionRejected: Kraken rejects the subscription permanently
             according to the collector's classification.
         ConnectionClosed: The WebSocket closes, normally or abnormally.
@@ -267,6 +288,7 @@ async def collect_session(
     async with asyncio.timeout(STARTUP_TIMEOUT):
         await ws.send(json.dumps(subscription))
 
+    current_books: dict[str, Book] = {}
     while True:
         timeout = IDLE_TIMEOUT
         if pending_acks or pending_snapshots:
@@ -306,7 +328,7 @@ async def collect_session(
                 events.warning("Subscription warning: %s", warning)
         elif message.get("channel") == "book":
             kind, data = message.get("type"), message.get("data")
-            if kind not in {"snapshot", "update"} or not isinstance(data, list) or not data:
+            if kind not in ("snapshot", "update") or not isinstance(data, list) or not data:
                 raise ReconnectRequired("Malformed book message")
             symbols = set()
             for item in data:
@@ -318,8 +340,34 @@ async def collect_session(
                 symbols.add(symbol)
             await writer.write(raw)
             if kind == "snapshot":
+                for item in data:
+                    symbol = item["symbol"]
+                    if symbol in current_books:
+                        events.info("Received fresh snapshot for %s, replacing current book", symbol)
+                    try:
+                        snapshot = SnapshotData.model_validate(item)
+                        current_books[symbol] = snapshot.to_book(depth=DEPTH)
+                    except ValueError as error:
+                        raise ReconnectRequired(f"Invalid snapshot for {symbol}: {error}") from error
+                    except ChecksumFailureError as error:
+                        raise ReconnectRequired(f"Snapshot checksum failed for {symbol}") from error
                 pending_snapshots.difference_update(symbols)
-                events.info("Saved fresh snapshot: %s", ", ".join(sorted(symbols)))
+                events.info("Saved and validated fresh snapshot: %s", ", ".join(sorted(symbols)))
+
+            if kind == "update":
+                for item in data:
+                    symbol = item["symbol"]
+                    if symbol not in current_books:
+                        raise ReconnectRequired("Received update but no book is being tracked")
+
+                    try:
+                        update = UpdateData.model_validate(item).to_update()
+                        current_books[symbol].apply_update(update)
+                    except ValueError as error:
+                        raise ReconnectRequired(f"Invalid update for {symbol}: {error}") from error
+                    except ChecksumFailureError as error:
+                        raise ReconnectRequired(f"Update checksum failed for {symbol}") from error
+
         elif message.get("channel") == "status":
             events.info("Kraken status: %s", message.get("data"))
         elif message.get("channel") == "heartbeat":
