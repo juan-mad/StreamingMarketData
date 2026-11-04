@@ -1,0 +1,35 @@
+# Relative paths are resolved against this YAML file, not the working directory.
+logging:
+  directory: ../../logs
+  level: INFO
+  application_filename: application.log
+  events_filename: kraken_book_L2_resilient.events.log
+  raw_filename: kraken_ws_raw.jsonl
+  samples_filename: kraken_validated_books.jsonl
+  rotation_minutes: 15
+  diagnostic_backups: 7
+
+ingestion:
+  url: wss://ws.kraken.com/v2
+  symbols:
+    - BTC/USD
+    - ETH/USD
+
+  # DO NOT CHANGE DEPTH
+  depth: 25
+  startup_timeout: 30.0
+  idle_timeout: 45.0
+  min_retry_delay: 5.0
+  max_retry_delay: 60.0
+  stable_connection_time: 60.0
+  book_sample_interval: 1.0
+  open_timeout: 20.0
+  ping_interval: 20.0
+  ping_timeout: 30.0
+  close_timeout: 10.0
+  max_queue: 128
+  max_size: 4194304
+
+conversion:
+  output_directory: ../../output_dir
+  scan_interval: 10.0

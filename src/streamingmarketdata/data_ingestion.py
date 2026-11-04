@@ -1,16 +1,15 @@
 """Archive every received Kraken message and recover from connection errors.
 
-Run with ``python -m streamingmarketdata.data_ingestion``. Configure
-symbols, book depth, log directory, and timeouts through the module constants;
-all timeout and retry-delay constants are expressed in seconds.
+Launch through ``python -m streamingmarketdata --config PATH``. Settings are
+loaded from YAML by the application and passed explicitly to this component.
 
 Every received message is archived before decoding or validation. JSONL records
 contain a connection/session UUID, the machine's UTC reception timestamp,
 original payload, and payload encoding. Files rotate every 15 minutes without
-deleting old files. Operational messages go to stderr and a separate UTC log
-with seven daily backups.
+deleting old files. Operational messages go to stderr and a separate UTC log.
+Rotation intervals, file names, and diagnostic retention come from YAML.
 
-Validated books are sampled independently at BOOK_SAMPLE_INTERVAL seconds into
+Validated books are sampled independently at the configured interval into
 kraken_validated_books.jsonl. Samples retain the session ID, machine sampling
 time, exchange timestamp, and exact decimal values. Sampling stops before a
 failed session reconnects; both raw and sampled write failures stop collection.
@@ -29,7 +28,6 @@ import json
 import logging
 import math
 import random
-import signal
 import ssl
 import sys
 import time
@@ -45,20 +43,10 @@ from uuid import UUID, uuid4
 
 from streamingmarketdata.book import Book, ChecksumFailureError
 from streamingmarketdata.book_messages import SnapshotData, UpdateData
+from streamingmarketdata.configuration import AppConfig, IngestionSettings, LoggingSettings
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.client import process_exception
 from websockets.exceptions import ConnectionClosed, InvalidStatus
-
-URL = "wss://ws.kraken.com/v2"
-SYMBOLS = ["BTC/USD", "ETH/USD"]
-DEPTH = 25
-LOG_DIRECTORY = Path("logs")
-STARTUP_TIMEOUT = 30.0
-IDLE_TIMEOUT = 45.0
-MIN_RETRY_DELAY = 5.0
-MAX_RETRY_DELAY = 60.0
-STABLE_CONNECTION_TIME = 60.0
-BOOK_SAMPLE_INTERVAL = 1.0
 
 
 class ReconnectRequired(RuntimeError):
@@ -232,7 +220,7 @@ class ValidatedBookSampleWriter:
             raise
 
     async def save_books_periodically(
-        self, books: dict[str, Book], session_id: UUID, interval: float = 1.0,
+        self, books: dict[str, Book], session_id: UUID, interval: float,
     ) -> None:
         """Sample validated books on monotonic deadlines, skipping missed intervals.
 
@@ -283,19 +271,20 @@ class ValidatedBookSampleWriter:
 
 @contextmanager
 def open_logs(
-    directory: Path,
+    directory: Path, settings: LoggingSettings,
 ) -> Iterator[tuple[RawMessageWriter, ValidatedBookSampleWriter, logging.Logger]]:
     """Provide raw and sampled data writers and a logger, then close their handlers.
 
-    Diagnostics go to stderr and a daily UTC log with seven backups. Timestamped
+    Diagnostics go to stderr and a daily UTC log with configured retention. Timestamped
     raw messages and sampled validated books go to separate JSONL logs that
-    rotate every 15 minutes without automatic deletion. Handlers are removed
+    rotate at the configured interval without automatic deletion. Handlers are removed
     and closed when the context exits, including when setup or collection raises
     an exception.
 
     Args:
         directory (Path): Log directory, created with missing parent directories.
             Relative paths are resolved against the process working directory.
+        settings (LoggingSettings): File names, rotation, retention, and log level.
 
     Yields:
         tuple[RawMessageWriter, ValidatedBookSampleWriter, logging.Logger]: Raw
@@ -306,7 +295,7 @@ def open_logs(
     """
     directory.mkdir(parents=True, exist_ok=True)
     events = logging.getLogger("kraken.book.resilient")
-    events.setLevel(logging.INFO)
+    events.setLevel(settings.level)
     events.propagate = False
     formatter = logging.Formatter("%(asctime)sZ %(levelname)s %(message)s")
     formatter.converter = time.gmtime
@@ -319,8 +308,8 @@ def open_logs(
         stack.callback(events.removeHandler, console)
 
         diagnostics = TimedRotatingFileHandler(
-            directory / "kraken_book_L2_resilient.events.log",
-            when="midnight", backupCount=7, encoding="utf-8", utc=True,
+            directory / settings.events_filename,
+            when="midnight", backupCount=settings.diagnostic_backups, encoding="utf-8", utc=True,
         )
         stack.callback(diagnostics.close)
         diagnostics.setFormatter(formatter)
@@ -328,15 +317,15 @@ def open_logs(
         stack.callback(events.removeHandler, diagnostics)
 
         data = StrictFileHandler(
-            directory / "kraken_ws_raw.jsonl",
-            when="m", interval=15, backupCount=0, encoding="utf-8", utc=True,
+            directory / settings.raw_filename,
+            when="m", interval=settings.rotation_minutes, backupCount=0, encoding="utf-8", utc=True,
         )
         stack.callback(data.close)
         data.setFormatter(logging.Formatter("%(message)s"))
 
         samples = StrictFileHandler(
-            directory / "kraken_validated_books.jsonl",
-            when="m", interval=15, backupCount=0, encoding="utf-8", utc=True,
+            directory / settings.samples_filename,
+            when="m", interval=settings.rotation_minutes, backupCount=0, encoding="utf-8", utc=True,
         )
         stack.callback(samples.close)
         samples.setFormatter(logging.Formatter("%(message)s"))
@@ -405,7 +394,7 @@ def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
 
 async def collect_session(
     ws: ClientConnection, writer: RawMessageWriter, events: logging.Logger, state: SessionState,
-    sample_writer: ValidatedBookSampleWriter,
+    sample_writer: ValidatedBookSampleWriter, settings: IngestionSettings,
 ) -> None:
     """Supervise reception and periodic book saving for one WebSocket session.
 
@@ -421,6 +410,7 @@ async def collect_session(
         state (SessionState): Session identifier and subscription readiness state.
         sample_writer (ValidatedBookSampleWriter): Writer for periodic book states;
             its handler remains open until this session has finished.
+        settings (IngestionSettings): Subscription, timeout, and sampling settings.
 
     Returns:
         None: Runs until reception ends, an error occurs, or shutdown is requested.
@@ -438,12 +428,12 @@ async def collect_session(
         async with asyncio.TaskGroup() as tasks:
             saver = tasks.create_task(
                 sample_writer.save_books_periodically(
-                    current_books, state.session_id, interval=BOOK_SAMPLE_INTERVAL,
+                    current_books, state.session_id, interval=settings.book_sample_interval,
                 ),
                 name=f"book-sampler-{state.session_id}",
             )
             try:
-                await _receive_session(ws, writer, events, state, current_books)
+                await _receive_session(ws, writer, events, state, current_books, settings)
             finally:
                 current_books.clear()
                 saver.cancel()
@@ -457,7 +447,7 @@ async def collect_session(
 
 async def _receive_session(
     ws: ClientConnection, writer: RawMessageWriter, events: logging.Logger, state: SessionState,
-    current_books: dict[str, Book],
+    current_books: dict[str, Book], settings: IngestionSettings,
 ) -> None:
     """Archive all received messages and validate books for one connection.
 
@@ -483,6 +473,7 @@ async def _receive_session(
             session_id identifies every archived message from this connection.
         current_books (dict[str, Book]): Shared validated books read by the
             sampling task on the same event loop. Updates commit without yielding.
+        settings (IngestionSettings): Subscription and reception timeout settings.
 
     Returns:
         None: Runs until connection closure, failure, or cancellation; there is
@@ -499,19 +490,19 @@ async def _receive_session(
         asyncio.CancelledError: The session is cancelled during shutdown.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + STARTUP_TIMEOUT
-    pending_acks = set(SYMBOLS)
-    pending_snapshots = set(SYMBOLS)
+    deadline = loop.time() + settings.startup_timeout
+    pending_acks = set(settings.symbols)
+    pending_snapshots = set(settings.symbols)
     subscription = {
         "method": "subscribe",
-        "params": {"channel": "book", "symbol": SYMBOLS, "depth": DEPTH, "snapshot": True},
+        "params": {"channel": "book", "symbol": settings.symbols, "depth": settings.depth, "snapshot": True},
         "req_id": 1,
     }
-    async with asyncio.timeout(STARTUP_TIMEOUT):
+    async with asyncio.timeout(settings.startup_timeout):
         await ws.send(json.dumps(subscription))
 
     while True:
-        timeout = IDLE_TIMEOUT
+        timeout = settings.idle_timeout
         if pending_acks or pending_snapshots:
             timeout = min(timeout, deadline - loop.time())
             if timeout <= 0:
@@ -540,13 +531,13 @@ async def _receive_session(
             if (
                 not isinstance(result, dict)
                 or result.get("channel") != "book"
-                or result.get("symbol") not in SYMBOLS
-                or result.get("depth") != DEPTH
+                or result.get("symbol") not in settings.symbols
+                or result.get("depth") != settings.depth
                 or message.get("req_id") != 1
             ):
                 raise ReconnectRequired("Unexpected subscription acknowledgement")
             pending_acks.discard(result["symbol"])
-            events.info("Subscribed: %s, depth=%s", result["symbol"], DEPTH)
+            events.info("Subscribed: %s, depth=%s", result["symbol"], settings.depth)
             for warning in result.get("warnings", []):
                 events.warning("Subscription warning: %s", warning)
         elif message.get("channel") == "book":
@@ -555,7 +546,7 @@ async def _receive_session(
                 raise ReconnectRequired("Malformed book message")
             symbols = set()
             for item in data:
-                if not isinstance(item, dict) or item.get("symbol") not in SYMBOLS:
+                if not isinstance(item, dict) or item.get("symbol") not in settings.symbols:
                     raise ReconnectRequired("Unexpected book symbol")
                 symbol = item["symbol"]
                 if kind == "update" and symbol in pending_snapshots:
@@ -568,7 +559,7 @@ async def _receive_session(
                         events.info("Received fresh snapshot for %s, replacing current book", symbol)
                     try:
                         snapshot = SnapshotData.model_validate(item)
-                        current_books[symbol] = snapshot.to_book(depth=DEPTH)
+                        current_books[symbol] = snapshot.to_book(depth=settings.depth)
                     except ValueError as error:
                         raise ReconnectRequired(f"Invalid snapshot for {symbol}: {error}") from error
                     except ChecksumFailureError as error:
@@ -628,6 +619,7 @@ def is_retryable(error: Exception) -> bool:
 
 async def ingest(
     writer: RawMessageWriter, events: logging.Logger, sample_writer: ValidatedBookSampleWriter,
+    settings: IngestionSettings,
 ) -> None:
     """Collect continuously, reconnecting after errors classified as temporary.
 
@@ -635,19 +627,18 @@ async def ingest(
     every archived message. Failed sessions close before retrying with
     exponential backoff and bounded random jitter.
     The base delay resets only after a fully ready session has remained stable
-    for STABLE_CONNECTION_TIME. Every reconnect requests fresh snapshots and
+    for the configured stable connection time. Every reconnect requests fresh snapshots and
     reports a data gap; missed historical updates are not recovered.
 
-    Connection opening, pong reception, and closing have timeouts of 20, 30,
-    and 10 seconds respectively. Keepalive pings run every 20 seconds. Incoming
-    messages are limited to 4 MiB, with a receive-buffer high-water mark of
-    128 frames.
+    Connection timeouts, keepalive intervals, message-size limits, and the
+    receive-buffer high-water mark come from the ingestion settings.
 
     Args:
         writer (RawMessageWriter): Shared destination for timestamped raw messages.
         events (logging.Logger): Logger for attempts, failures, and retry delays.
         sample_writer (ValidatedBookSampleWriter): Shared sampled-book destination;
             each connection owns a separate, supervised sampling task.
+        settings (IngestionSettings): Connection, subscription, sampling, and retry settings.
 
     Returns:
         None: Runs until cancellation or an unrecoverable error, without a
@@ -658,44 +649,44 @@ async def ingest(
             including subscription rejection or inability to archive messages.
         asyncio.CancelledError: Collection or a retry wait is cancelled.
     """
-    delay = MIN_RETRY_DELAY
+    delay = settings.min_retry_delay
     loop = asyncio.get_running_loop()
     while True:
         state = SessionState()
         try:
-            events.info("Connecting to %s (session_id=%s)", URL, state.session_id)
+            events.info("Connecting to %s (session_id=%s)", settings.url, state.session_id)
             async with connect(
-                URL, open_timeout=20, ping_interval=20, ping_timeout=30,
-                close_timeout=10, max_queue=128, max_size=4 * 1024 * 1024,
+                settings.url, open_timeout=settings.open_timeout,
+                ping_interval=settings.ping_interval, ping_timeout=settings.ping_timeout,
+                close_timeout=settings.close_timeout, max_queue=settings.max_queue,
+                max_size=settings.max_size,
                 logger=events.getChild("websocket"),
             ) as ws:
                 events.info("WebSocket connected (session_id=%s)", state.session_id)
-                await collect_session(ws, writer, events, state, sample_writer)
+                await collect_session(ws, writer, events, state, sample_writer, settings)
         except Exception as error:
             if not is_retryable(error):
                 raise
-            if state.ready_at is not None and loop.time() - state.ready_at >= STABLE_CONNECTION_TIME:
-                delay = MIN_RETRY_DELAY
-            wait = random.uniform(delay, min(MAX_RETRY_DELAY, delay * 1.25))
+            if state.ready_at is not None and loop.time() - state.ready_at >= settings.stable_connection_time:
+                delay = settings.min_retry_delay
+            wait = random.uniform(delay, min(settings.max_retry_delay, delay * 1.25))
             events.warning(
                 "Connection interrupted (session_id=%s, %s: %s). Data gap; reconnecting in %.1fs "
                 "and requesting fresh snapshots.", state.session_id, type(error).__name__, error, wait,
                 exc_info=True,
             )
             await asyncio.sleep(wait)
-            delay = min(MAX_RETRY_DELAY, delay * 2)
+            delay = min(settings.max_retry_delay, delay * 2)
 
 
-async def main() -> None:
-    """Open logs and run the collector with shutdown and fatal-error reporting.
+async def main(config: AppConfig) -> None:
+    """Open collection logs and run until the application cancels this component.
 
-    Register SIGTERM cancellation where supported; asyncio.run handles Ctrl+C
-    when this coroutine is the program entry point. Cancellation unwinds the
-    connection context and lets a protected data write finish. The installed
-    SIGTERM handler is removed before the log handlers are closed.
+    Cancellation unwinds the connection context and lets protected writes finish.
+    The application launcher owns signal handling and supervises both components.
 
     Args:
-        None: Configuration is read from this module's constants.
+        config (AppConfig): Validated application settings loaded from YAML.
 
     Returns:
         None: No result is produced; normal operation continues until stopped.
@@ -705,33 +696,12 @@ async def main() -> None:
         Exception: Log setup fails or ingestion encounters an unrecoverable error.
             Ingestion failures are logged with their traceback before propagation.
     """
-    with open_logs(LOG_DIRECTORY) as (writer, sample_writer, events):
-        loop = asyncio.get_running_loop()
-        task = asyncio.current_task()
-        sigterm_installed = False
+    with open_logs(config.logging.directory, config.logging) as (writer, sample_writer, events):
         try:
-            loop.add_signal_handler(signal.SIGTERM, task.cancel)
-            sigterm_installed = True
-        except (NotImplementedError, RuntimeError):
-            pass  # asyncio.run still handles Ctrl+C on platforms without signal handlers.
-        try:
-            await ingest(writer, events, sample_writer)
+            await ingest(writer, events, sample_writer, config.ingestion)
         except asyncio.CancelledError:
             events.info("Stopped; closing the connection and flushing logs")
             raise
         except Exception:
             events.exception("Ingestion stopped after an unrecoverable error")
             raise
-        finally:
-            if sigterm_installed:
-                loop.remove_signal_handler(signal.SIGTERM)
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    except Exception as error:
-        print(f"Fatal ingestion error: {error}", file=sys.stderr)
-        raise SystemExit(1)

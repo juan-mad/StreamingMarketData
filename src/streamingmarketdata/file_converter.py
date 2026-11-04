@@ -1,20 +1,23 @@
+"""Compress closed raw archives using the application's shared configuration."""
+
 import asyncio
-from pathlib import Path
 import gzip
 import logging
 import shutil
+from pathlib import Path
 
-WAIT = 10
-LOG_DIRECTORY = Path("logs")
-logger = logging.getLogger(__name__)
+from streamingmarketdata.configuration import AppConfig
 
 
-def compress_and_delete_raw_file(raw_file_path: Path, output_dir: Path) -> None:
+def compress_and_delete_raw_file(
+    raw_file_path: Path, output_dir: Path, logger: logging.Logger,
+) -> None:
     """Compress a raw file and delete it only after compression succeeds.
 
     Args:
         raw_file_path (Path): Raw file to compress.
         output_dir (Path): Directory receiving the gzip file.
+        logger (logging.Logger): Shared application logger for progress and failures.
 
     Returns:
         None: Failures are logged and the raw file is retained for retry.
@@ -31,45 +34,59 @@ def compress_and_delete_raw_file(raw_file_path: Path, output_dir: Path) -> None:
         logger.exception("Failed to process %s; will retry on the next scan", raw_file_path)
 
 
-async def main(input_dir: Path, output_dir: Path) -> None:
+async def compress_file(raw_file_path: Path, output_dir: Path, logger: logging.Logger) -> None:
+    """Wait for a compression worker to finish even when shutdown is requested.
+
+    Args:
+        raw_file_path (Path): Closed raw archive to compress and delete.
+        output_dir (Path): Directory receiving the gzip file.
+        logger (logging.Logger): Application logger kept open until work finishes.
+
+    Returns:
+        None: Compression completed or its failure was logged for later retry.
+
+    Raises:
+        asyncio.CancelledError: Shutdown was requested; the worker finished first.
+    """
+    work = asyncio.create_task(asyncio.to_thread(
+        compress_and_delete_raw_file, raw_file_path, output_dir, logger,
+    ))
+    try:
+        await asyncio.shield(work)
+    except asyncio.CancelledError:
+        await work
+        raise
+
+
+async def main(config: AppConfig) -> None:
     """Continuously compress raw files, recovering from processing errors.
 
     Args:
-        input_dir (Path): Directory scanned for raw message files.
-        output_dir (Path): Directory receiving compressed files.
+        config (AppConfig): Shared log directory, raw file name, output directory,
+            and scan interval loaded from YAML.
 
     Returns:
         None: Runs until interrupted or cancelled.
+
+    Raises:
+        asyncio.CancelledError: Shutdown was requested; active workers are awaited.
     """
+    input_dir = config.logging.directory
+    output_dir = config.conversion.output_directory
+    logger = logging.getLogger(__name__)
     logger.info("File converter started: input=%s, output=%s", input_dir, output_dir)
     while True:
-        await asyncio.sleep(WAIT)
+        await asyncio.sleep(config.conversion.scan_interval)
         logger.info("Checking %s for raw message files", input_dir)
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
-            raw_message_files = list(input_dir.glob("kraken_ws_raw.jsonl.*"))
+            raw_message_files = [
+                file for file in input_dir.glob(f"{config.logging.raw_filename}.*")
+                if file.is_file() and not file.name.endswith(".gz")
+            ]
 
             async with asyncio.TaskGroup() as tg:
                 for file in raw_message_files:
-                    tg.create_task(asyncio.to_thread(compress_and_delete_raw_file, file, output_dir))
+                    tg.create_task(compress_file(file, output_dir, logger))
         except Exception:
-            logger.exception("Conversion scan failed; will retry in %s seconds", WAIT)
-
-
-if __name__ == "__main__":
-    LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        filename=LOG_DIRECTORY / "file_converter.log",
-        filemode="a",
-        encoding="utf-8",
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    input_dir = Path("./input_dir")
-    output_dir = Path("./output_dir")
-
-    try:
-        asyncio.run(main(input_dir, output_dir))
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        logger.info("File converter stopped by cancellation")
+            logger.exception("Conversion scan failed; will retry in %s seconds", config.conversion.scan_interval)
