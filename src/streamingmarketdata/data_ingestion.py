@@ -1,20 +1,25 @@
-"""Archive Kraken book messages while recovering from transient connection errors.
+"""Archive every received Kraken message and recover from connection errors.
 
-Run with ``python -m streamingmarketdata.data_ingestion_resilient``. Configure
+Run with ``python -m streamingmarketdata.data_ingestion``. Configure
 symbols, book depth, log directory, and timeouts through the module constants;
 all timeout and retry-delay constants are expressed in seconds.
 
-Book messages retain their original numeric text in JSONL files, which rotate
-every 15 minutes without deleting old files. Operational messages go to stderr
-and a separate UTC diagnostic log, which rotates daily with seven backups.
+Every received message is archived before decoding or validation. JSONL records
+contain a connection/session UUID, the machine's UTC reception timestamp,
+original payload, and payload encoding. Files rotate every 15 minutes without
+deleting old files. Operational messages go to stderr and a separate UTC log
+with seven daily backups.
 
 Each connection requests fresh snapshots before accepting updates for a symbol.
 Every price level and metadata field is validated, and reconstructed books are
-checked against Kraken's top-ten CRC32. Raw logs also retain rejected book
-messages for diagnosis. Updates missed while disconnected cannot be recovered.
+checked against Kraken's top-ten CRC32. Raw logs also retain acknowledgements,
+heartbeats, and rejected messages. Updates missed during disconnects cannot be
+recovered. Reception timestamps mark delivery to the application, not packet
+arrival at the network interface or the time Kraken generated the message.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -24,11 +29,13 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
+from uuid import UUID, uuid4
 
 from streamingmarketdata.book import Book, ChecksumFailureError
 from streamingmarketdata.book_messages import SnapshotData, UpdateData
@@ -56,11 +63,11 @@ class SubscriptionRejected(RuntimeError):
 
 
 class DataWriteError(RuntimeError):
-    """Signal a book-log failure that must stop collection rather than reconnect."""
+    """Signal an archive failure that must stop collection rather than reconnect."""
 
 
 class StrictFileHandler(TimedRotatingFileHandler):
-    """Rotate book logs while propagating write failures to the collector."""
+    """Rotate raw message logs while propagating write failures to the collector."""
 
     def handleError(self, record: logging.LogRecord) -> None:
         """Turn a logging failure into a fatal collector error.
@@ -77,17 +84,17 @@ class StrictFileHandler(TimedRotatingFileHandler):
         Raises:
             DataWriteError: Always, chained from the active logging exception.
         """
-        raise DataWriteError("Failed to save a book message") from sys.exception()
+        raise DataWriteError("Failed to archive a received message") from sys.exception()
 
 
-class BookDataWriter:
-    """Write raw JSON through a rotating handler without blocking the event loop.
+class RawMessageWriter:
+    """Archive timestamped raw messages without blocking the event loop.
 
     Callers must await writes sequentially to preserve receive order. The owner
     of the supplied handler remains responsible for closing it.
 
     Attributes:
-        handler (StrictFileHandler): Destination for book-message records.
+        handler (StrictFileHandler): Destination for raw archive records.
     """
 
     def __init__(self, handler: StrictFileHandler) -> None:
@@ -101,17 +108,23 @@ class BookDataWriter:
         """
         self.handler = handler
 
-    async def write(self, raw_message: str) -> None:
-        """Save one JSON message in a worker thread and wait for completion.
+    async def write(
+        self, raw_message: str | bytes, received_at: datetime, session_id: UUID,
+    ) -> None:
+        """Archive an original payload with its reception time and connection ID.
 
-        Physical carriage returns and newlines are removed to keep each record
-        on one line. Numeric text and escaped newlines inside strings remain
-        intact. This method expects JSON that has already been decoded safely.
+        Text payloads are stored as JSON strings, preserving numeric formatting,
+        whitespace, and malformed content without parsing it. Binary payloads
+        are base64 encoded. JSON escaping keeps each record on one physical line.
         Cancellation waits for the protected write before propagating, allowing
         the handler to be closed without interrupting that write.
 
         Args:
-            raw_message (str): Original, valid JSON text received from Kraken.
+            raw_message (str | bytes): Unmodified payload returned by ws.recv().
+            received_at (datetime): Timezone-aware machine time captured as soon
+                as ws.recv() returns; converted to UTC for archival.
+            session_id (UUID): Local identifier shared by all messages received
+                over this WebSocket connection, including all subscribed symbols.
 
         Returns:
             None: Completion indicates the handler finished writing the record;
@@ -119,10 +132,24 @@ class BookDataWriter:
 
         Raises:
             DataWriteError: The handler could not save the record.
+            ValueError: The reception timestamp lacks a timezone.
             asyncio.CancelledError: Collection was cancelled during the write.
         """
-        line = raw_message.replace("\r", "").replace("\n", "")
-        record = logging.LogRecord("kraken.book.data", logging.INFO, "", 0, line, (), None)
+        if received_at.utcoffset() is None:
+            raise ValueError("Reception timestamp must include a timezone")
+        if isinstance(raw_message, bytes):
+            payload = base64.b64encode(raw_message).decode("ascii")
+            encoding = "base64"
+        else:
+            payload = raw_message
+            encoding = "utf-8"
+        line = json.dumps({
+            "session_id": str(session_id),
+            "received_at": received_at.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "payload": payload,
+            "payload_encoding": encoding,
+        }, separators=(",", ":"))
+        record = logging.LogRecord("kraken.websocket.raw", logging.INFO, "", 0, line, (), None)
         work = asyncio.create_task(asyncio.to_thread(self.handler.handle, record))
         try:
             await asyncio.shield(work)
@@ -132,11 +159,11 @@ class BookDataWriter:
 
 
 @contextmanager
-def open_logs(directory: Path) -> Iterator[tuple[BookDataWriter, logging.Logger]]:
+def open_logs(directory: Path) -> Iterator[tuple[RawMessageWriter, logging.Logger]]:
     """Provide the data writer and event logger, then clean up their handlers.
 
-    Diagnostics go to stderr and a daily UTC log with seven backups. Raw book
-    messages go to a JSONL log that rotates every 15 minutes without automatic
+    Diagnostics go to stderr and a daily UTC log with seven backups. Timestamped
+    raw messages go to a JSONL log that rotates every 15 minutes without automatic
     deletion. Handlers are removed and closed when the context exits, including
     when setup or collection raises an exception.
 
@@ -145,7 +172,7 @@ def open_logs(directory: Path) -> Iterator[tuple[BookDataWriter, logging.Logger]
             Relative paths are resolved against the process working directory.
 
     Yields:
-        tuple[BookDataWriter, logging.Logger]: Writer for raw book messages and
+        tuple[RawMessageWriter, logging.Logger]: Writer for received messages and
             logger for operational events, valid within the context.
 
     Raises:
@@ -175,25 +202,29 @@ def open_logs(directory: Path) -> Iterator[tuple[BookDataWriter, logging.Logger]
         stack.callback(events.removeHandler, diagnostics)
 
         data = StrictFileHandler(
-            directory / "kraken_book_L2_resilient.jsonl",
+            directory / "kraken_ws_raw.jsonl",
             when="m", interval=15, backupCount=0, encoding="utf-8", utc=True,
         )
         stack.callback(data.close)
         data.setFormatter(logging.Formatter("%(message)s"))
-        yield BookDataWriter(data), events
+        yield RawMessageWriter(data), events
 
 
 @dataclass
 class SessionState:
-    """Track when the current connection became ready for normal collection.
+    """Identify one connection attempt and track when its subscriptions are ready.
 
     Attributes:
         ready_at (float | None): Event-loop monotonic time when every requested
             symbol was acknowledged and its snapshot saved. None means startup
             has not completed. Used to decide when retry backoff can reset.
+        session_id (UUID): Locally generated identifier for this connection
+            attempt. A new state generates a new ID, independent of process
+            restarts, symbols, and archive file rotation.
     """
 
     ready_at: float | None = None
+    session_id: UUID = field(default_factory=uuid4)
 
 
 def reject_json_constant(value: str) -> NoReturn:
@@ -240,16 +271,18 @@ def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
 
 
 async def collect_session(
-    ws: ClientConnection, writer: BookDataWriter, events: logging.Logger, state: SessionState,
+    ws: ClientConnection, writer: RawMessageWriter, events: logging.Logger, state: SessionState,
 ) -> None:
-    """Subscribe and archive book messages for one established connection.
+    """Archive all received messages and validate books for one connection.
 
     Request fresh snapshots and track acknowledgements and snapshots separately
     for each configured symbol. A fixed startup deadline applies even while
     heartbeats arrive. After startup, each receive has an idle timeout.
 
-    Save raw snapshots and subsequent updates sequentially. Status messages and
-    subscription warnings go to the event logger; heartbeats are not archived.
+    Capture a UTC reception timestamp immediately after each receive completes,
+    then archive the original payload before decoding or filtering. This includes
+    acknowledgements, status messages, heartbeats, and malformed messages. Status
+    messages and subscription warnings also go to the event logger.
     A symbol's updates are accepted after its snapshot has been validated and
     saved, even if other symbols are still starting up. Each item is validated
     before converting its levels to dictionaries, then its CRC32 is checked.
@@ -257,10 +290,11 @@ async def collect_session(
 
     Args:
         ws (ClientConnection): Open WebSocket connection owned by the caller.
-        writer (BookDataWriter): Destination for original book-message JSON.
+        writer (RawMessageWriter): Destination for timestamped original payloads.
         events (logging.Logger): Destination for connection and service events.
         state (SessionState): Mutable state whose ready_at is set once all
-            acknowledgements and snapshots have been received and saved.
+            acknowledgements and snapshots have been received and saved. Its
+            session_id identifies every archived message from this connection.
 
     Returns:
         None: Runs until connection closure, failure, or cancellation; there is
@@ -273,7 +307,7 @@ async def collect_session(
             according to the collector's classification.
         ConnectionClosed: The WebSocket closes, normally or abnormally.
         TimeoutError: Sending the subscription exceeds the startup timeout.
-        DataWriteError: A book message cannot be saved.
+        DataWriteError: A received message cannot be archived.
         asyncio.CancelledError: The session is cancelled during shutdown.
     """
     loop = asyncio.get_running_loop()
@@ -300,13 +334,15 @@ async def collect_session(
                 )
         try:
             raw_message = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            received_at = datetime.now(UTC)
         except TimeoutError as error:
             raise ReconnectRequired(
                 f"No message before timeout; acknowledgements={sorted(pending_acks)}, "
                 f"snapshots={sorted(pending_snapshots)}"
             ) from error
 
-        raw, message = decode_message(raw_message)
+        await writer.write(raw_message, received_at, state.session_id)
+        _, message = decode_message(raw_message)
         if message.get("method") == "subscribe":
             if message.get("success") is not True:
                 reason = str(message.get("error", "Unknown subscription error"))
@@ -338,7 +374,6 @@ async def collect_session(
                 if kind == "update" and symbol in pending_snapshots:
                     raise ReconnectRequired(f"Received {symbol} update before its snapshot")
                 symbols.add(symbol)
-            await writer.write(raw)
             if kind == "snapshot":
                 for item in data:
                     symbol = item["symbol"]
@@ -404,11 +439,12 @@ def is_retryable(error: Exception) -> bool:
     return process_exception(error) is None
 
 
-async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
+async def ingest(writer: RawMessageWriter, events: logging.Logger) -> None:
     """Collect continuously, reconnecting after errors classified as temporary.
 
-    Each attempt creates a new connection and session state. Failed sessions
-    close before retrying with exponential backoff and bounded random jitter.
+    Each attempt creates new session state with a fresh UUID that is included in
+    every archived message. Failed sessions close before retrying with
+    exponential backoff and bounded random jitter.
     The base delay resets only after a fully ready session has remained stable
     for STABLE_CONNECTION_TIME. Every reconnect requests fresh snapshots and
     reports a data gap; missed historical updates are not recovered.
@@ -419,7 +455,7 @@ async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
     128 frames.
 
     Args:
-        writer (BookDataWriter): Shared destination for raw book messages.
+        writer (RawMessageWriter): Shared destination for timestamped raw messages.
         events (logging.Logger): Logger for attempts, failures, and retry delays.
 
     Returns:
@@ -428,7 +464,7 @@ async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
 
     Raises:
         Exception: A connection or collection error is classified as fatal,
-            including subscription rejection or inability to save book data.
+            including subscription rejection or inability to archive messages.
         asyncio.CancelledError: Collection or a retry wait is cancelled.
     """
     delay = MIN_RETRY_DELAY
@@ -436,12 +472,13 @@ async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
     while True:
         state = SessionState()
         try:
-            events.info("Connecting to %s", URL)
+            events.info("Connecting to %s (session_id=%s)", URL, state.session_id)
             async with connect(
                 URL, open_timeout=20, ping_interval=20, ping_timeout=30,
                 close_timeout=10, max_queue=128, max_size=4 * 1024 * 1024,
                 logger=events.getChild("websocket"),
             ) as ws:
+                events.info("WebSocket connected (session_id=%s)", state.session_id)
                 await collect_session(ws, writer, events, state)
         except Exception as error:
             if not is_retryable(error):
@@ -450,8 +487,8 @@ async def ingest(writer: BookDataWriter, events: logging.Logger) -> None:
                 delay = MIN_RETRY_DELAY
             wait = random.uniform(delay, min(MAX_RETRY_DELAY, delay * 1.25))
             events.warning(
-                "Connection interrupted (%s: %s). Data gap; reconnecting in %.1fs "
-                "and requesting fresh snapshots.", type(error).__name__, error, wait,
+                "Connection interrupted (session_id=%s, %s: %s). Data gap; reconnecting in %.1fs "
+                "and requesting fresh snapshots.", state.session_id, type(error).__name__, error, wait,
                 exc_info=True,
             )
             await asyncio.sleep(wait)
