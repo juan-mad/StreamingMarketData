@@ -10,6 +10,11 @@ original payload, and payload encoding. Files rotate every 15 minutes without
 deleting old files. Operational messages go to stderr and a separate UTC log
 with seven daily backups.
 
+Validated books are sampled independently at BOOK_SAMPLE_INTERVAL seconds into
+kraken_validated_books.jsonl. Samples retain the session ID, machine sampling
+time, exchange timestamp, and exact decimal values. Sampling stops before a
+failed session reconnects; both raw and sampled write failures stop collection.
+
 Each connection requests fresh snapshots before accepting updates for a symbol.
 Every price level and metadata field is validated, and reconstructed books are
 checked against Kraken's top-ten CRC32. Raw logs also retain acknowledgements,
@@ -22,6 +27,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import random
 import signal
 import ssl
@@ -52,6 +58,7 @@ IDLE_TIMEOUT = 45.0
 MIN_RETRY_DELAY = 5.0
 MAX_RETRY_DELAY = 60.0
 STABLE_CONNECTION_TIME = 60.0
+BOOK_SAMPLE_INTERVAL = 1.0
 
 
 class ReconnectRequired(RuntimeError):
@@ -67,7 +74,7 @@ class DataWriteError(RuntimeError):
 
 
 class StrictFileHandler(TimedRotatingFileHandler):
-    """Rotate raw message logs while propagating write failures to the collector."""
+    """Rotate data logs while propagating write failures to the collector."""
 
     def handleError(self, record: logging.LogRecord) -> None:
         """Turn a logging failure into a fatal collector error.
@@ -84,7 +91,7 @@ class StrictFileHandler(TimedRotatingFileHandler):
         Raises:
             DataWriteError: Always, chained from the active logging exception.
         """
-        raise DataWriteError("Failed to archive a received message") from sys.exception()
+        raise DataWriteError(f"Failed to write data log: {self.baseFilename}") from sys.exception()
 
 
 class RawMessageWriter:
@@ -158,22 +165,141 @@ class RawMessageWriter:
             raise
 
 
+class ValidatedBookSampleWriter:
+    """Periodically save detached copies of the current validated books.
+
+    Writes are awaited sequentially. The handler's owner must close it only
+    after the sampling task has stopped and any active write has finished.
+
+    Attributes:
+        handler (StrictFileHandler): Destination for sampled book records.
+    """
+
+    def __init__(self, handler: StrictFileHandler) -> None:
+        """Store the file handler used for writes.
+
+        Args:
+            handler (StrictFileHandler): Configured handler owned by the caller.
+
+        Returns:
+            None.
+        """
+        self.handler = handler
+
+    def _write_records(self, records: list[dict]) -> None:
+        """Append a detached batch as individual JSONL records in a worker thread.
+
+        Args:
+            records (list[dict]): JSON-compatible copies of sampled book states.
+
+        Returns:
+            None: The handler has emitted every record, without an fsync guarantee.
+
+        Raises:
+            DataWriteError: Writing or rotating the destination file fails.
+            ValueError: A record contains a non-finite JSON number.
+            TypeError: A record contains a value that JSON cannot serialize.
+        """
+        for item in records:
+            line = json.dumps(item, separators=(",", ":"), allow_nan=False)
+            record = logging.LogRecord("kraken.book.sample", logging.INFO, "", 0, line, (), None)
+            self.handler.handle(record)
+
+    async def write(self, records: list[dict]) -> None:
+        """Write one detached batch while allowing network tasks to continue.
+
+        Args:
+            records (list[dict]): JSON-compatible records owned by this write;
+                callers must not mutate them until this method finishes.
+
+        Returns:
+            None: All records have been emitted, or the batch was empty.
+
+        Raises:
+            DataWriteError: The handler cannot save the batch.
+            ValueError: A record contains a non-finite JSON number.
+            TypeError: A record cannot be serialized as JSON.
+            asyncio.CancelledError: Cancellation propagates after an active
+                write has finished, so closing the handler cannot interrupt it.
+        """
+        if not records:
+            return
+        work = asyncio.create_task(asyncio.to_thread(self._write_records, records))
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError:
+            await work
+            raise
+
+    async def save_books_periodically(
+        self, books: dict[str, Book], session_id: UUID, interval: float = 1.0,
+    ) -> None:
+        """Sample validated books on monotonic deadlines, skipping missed intervals.
+
+        Copies are made without yielding to the receiver, then written in a
+        worker thread. Decimal values are serialized as strings. The book's timestamp is
+        the exchange timestamp; sampled_at is the machine's UTC sampling time.
+        Empty books are skipped until validated snapshots become available.
+
+        Args:
+            books (dict[str, Book]): Current books maintained on the same event
+                loop by the receiver; never pass these live objects to a thread.
+            session_id (UUID): Identifier of the current connection.
+            interval (float): Positive, finite sampling interval in seconds.
+
+        Returns:
+            None: Runs until cancelled or a write fails.
+
+        Raises:
+            ValueError: The interval is non-positive or non-finite.
+            DataWriteError: A sampled batch cannot be saved.
+            asyncio.CancelledError: The session or sampling task is stopped.
+        """
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError("interval must be positive and finite")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + interval
+
+        while True:
+            await asyncio.sleep(max(0.0, deadline - loop.time()))
+            sampled_at = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+            records = [
+                {
+                    "session_id": str(session_id),
+                    "sampled_at": sampled_at,
+                    **book.model_dump(mode="json"),
+                }
+                for book in books.values()
+            ]
+
+            if records:
+                await self.write(records)
+
+            deadline += interval
+            if deadline <= loop.time():
+                deadline = loop.time() + interval
+
+
 @contextmanager
-def open_logs(directory: Path) -> Iterator[tuple[RawMessageWriter, logging.Logger]]:
-    """Provide the data writer and event logger, then clean up their handlers.
+def open_logs(
+    directory: Path,
+) -> Iterator[tuple[RawMessageWriter, ValidatedBookSampleWriter, logging.Logger]]:
+    """Provide raw and sampled data writers and a logger, then close their handlers.
 
     Diagnostics go to stderr and a daily UTC log with seven backups. Timestamped
-    raw messages go to a JSONL log that rotates every 15 minutes without automatic
-    deletion. Handlers are removed and closed when the context exits, including
-    when setup or collection raises an exception.
+    raw messages and sampled validated books go to separate JSONL logs that
+    rotate every 15 minutes without automatic deletion. Handlers are removed
+    and closed when the context exits, including when setup or collection raises
+    an exception.
 
     Args:
         directory (Path): Log directory, created with missing parent directories.
             Relative paths are resolved against the process working directory.
 
     Yields:
-        tuple[RawMessageWriter, logging.Logger]: Writer for received messages and
-            logger for operational events, valid within the context.
+        tuple[RawMessageWriter, ValidatedBookSampleWriter, logging.Logger]: Raw
+            writer, sampled-book writer, and event logger, valid within the context.
 
     Raises:
         OSError: The directory or a log file cannot be created or opened.
@@ -207,7 +333,14 @@ def open_logs(directory: Path) -> Iterator[tuple[RawMessageWriter, logging.Logge
         )
         stack.callback(data.close)
         data.setFormatter(logging.Formatter("%(message)s"))
-        yield RawMessageWriter(data), events
+
+        samples = StrictFileHandler(
+            directory / "kraken_validated_books.jsonl",
+            when="m", interval=15, backupCount=0, encoding="utf-8", utc=True,
+        )
+        stack.callback(samples.close)
+        samples.setFormatter(logging.Formatter("%(message)s"))
+        yield RawMessageWriter(data), ValidatedBookSampleWriter(samples), events
 
 
 @dataclass
@@ -272,6 +405,59 @@ def decode_message(raw_message: str | bytes) -> tuple[str, dict]:
 
 async def collect_session(
     ws: ClientConnection, writer: RawMessageWriter, events: logging.Logger, state: SessionState,
+    sample_writer: ValidatedBookSampleWriter,
+) -> None:
+    """Supervise reception and periodic book saving for one WebSocket session.
+
+    A sampler failure cancels reception. When reception ends, the current books
+    are cleared and the sampler is cancelled and awaited, including its active
+    write, before this function exits. Storage failures take priority over a
+    simultaneous reconnectable failure.
+
+    Args:
+        ws (ClientConnection): Open connection owned by the caller.
+        writer (RawMessageWriter): Destination for every received raw message.
+        events (logging.Logger): Logger for subscription and service events.
+        state (SessionState): Session identifier and subscription readiness state.
+        sample_writer (ValidatedBookSampleWriter): Writer for periodic book states;
+            its handler remains open until this session has finished.
+
+    Returns:
+        None: Runs until reception ends, an error occurs, or shutdown is requested.
+
+    Raises:
+        ReconnectRequired: Incoming data, its CRC32, or session readiness fails.
+        ConnectionClosed: The WebSocket closes normally or abnormally.
+        SubscriptionRejected: Kraken permanently rejects the subscription.
+        DataWriteError: Raw or sampled data cannot be saved.
+        ValueError: The sampling interval is invalid.
+        asyncio.CancelledError: The session is cancelled during shutdown.
+    """
+    current_books: dict[str, Book] = {}
+    try:
+        async with asyncio.TaskGroup() as tasks:
+            saver = tasks.create_task(
+                sample_writer.save_books_periodically(
+                    current_books, state.session_id, interval=BOOK_SAMPLE_INTERVAL,
+                ),
+                name=f"book-sampler-{state.session_id}",
+            )
+            try:
+                await _receive_session(ws, writer, events, state, current_books)
+            finally:
+                current_books.clear()
+                saver.cancel()
+    except ExceptionGroup as errors:
+        # Keep the existing reconnect policy, prioritising a concurrent disk failure.
+        for error in errors.exceptions:
+            if not is_retryable(error):
+                raise error from errors
+        raise errors.exceptions[0] from errors
+
+
+async def _receive_session(
+    ws: ClientConnection, writer: RawMessageWriter, events: logging.Logger, state: SessionState,
+    current_books: dict[str, Book],
 ) -> None:
     """Archive all received messages and validate books for one connection.
 
@@ -295,6 +481,8 @@ async def collect_session(
         state (SessionState): Mutable state whose ready_at is set once all
             acknowledgements and snapshots have been received and saved. Its
             session_id identifies every archived message from this connection.
+        current_books (dict[str, Book]): Shared validated books read by the
+            sampling task on the same event loop. Updates commit without yielding.
 
     Returns:
         None: Runs until connection closure, failure, or cancellation; there is
@@ -322,7 +510,6 @@ async def collect_session(
     async with asyncio.timeout(STARTUP_TIMEOUT):
         await ws.send(json.dumps(subscription))
 
-    current_books: dict[str, Book] = {}
     while True:
         timeout = IDLE_TIMEOUT
         if pending_acks or pending_snapshots:
@@ -439,7 +626,9 @@ def is_retryable(error: Exception) -> bool:
     return process_exception(error) is None
 
 
-async def ingest(writer: RawMessageWriter, events: logging.Logger) -> None:
+async def ingest(
+    writer: RawMessageWriter, events: logging.Logger, sample_writer: ValidatedBookSampleWriter,
+) -> None:
     """Collect continuously, reconnecting after errors classified as temporary.
 
     Each attempt creates new session state with a fresh UUID that is included in
@@ -457,6 +646,8 @@ async def ingest(writer: RawMessageWriter, events: logging.Logger) -> None:
     Args:
         writer (RawMessageWriter): Shared destination for timestamped raw messages.
         events (logging.Logger): Logger for attempts, failures, and retry delays.
+        sample_writer (ValidatedBookSampleWriter): Shared sampled-book destination;
+            each connection owns a separate, supervised sampling task.
 
     Returns:
         None: Runs until cancellation or an unrecoverable error, without a
@@ -479,7 +670,7 @@ async def ingest(writer: RawMessageWriter, events: logging.Logger) -> None:
                 logger=events.getChild("websocket"),
             ) as ws:
                 events.info("WebSocket connected (session_id=%s)", state.session_id)
-                await collect_session(ws, writer, events, state)
+                await collect_session(ws, writer, events, state, sample_writer)
         except Exception as error:
             if not is_retryable(error):
                 raise
@@ -514,7 +705,7 @@ async def main() -> None:
         Exception: Log setup fails or ingestion encounters an unrecoverable error.
             Ingestion failures are logged with their traceback before propagation.
     """
-    with open_logs(LOG_DIRECTORY) as (writer, events):
+    with open_logs(LOG_DIRECTORY) as (writer, sample_writer, events):
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         sigterm_installed = False
@@ -524,7 +715,7 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass  # asyncio.run still handles Ctrl+C on platforms without signal handlers.
         try:
-            await ingest(writer, events)
+            await ingest(writer, events, sample_writer)
         except asyncio.CancelledError:
             events.info("Stopped; closing the connection and flushing logs")
             raise
